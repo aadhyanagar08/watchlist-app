@@ -1,95 +1,110 @@
-from typing import Tuple, Dict
-import numpy as np
+import streamlit as st
 import pandas as pd
+from src.storage import load_watchlist, save_watchlist, DEFAULT_CATEGORIES
+from src.data_sources import fetch_close_many
+from src.metrics import compute_all_metrics, daily_returns, TRADING_DAYS
 
-TRADING_DAYS = 252
+st.set_page_config(page_title="Custom Watchlist", layout="wide")
 
-def daily_returns(prices: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
-    return prices.pct_change().dropna()
+# ---- Sidebar controls
+st.sidebar.title("Watchlist Controls")
 
-def max_drawdown(prices: pd.Series) -> float:
-    cum = (1 + prices.pct_change().fillna(0)).cumprod()
-    peak = cum.cummax()
-    dd = cum / peak - 1.0
-    return float(dd.min()) if len(dd) else np.nan
+period = st.sidebar.selectbox("Timeframe", ["1y","3y","5y"], index=1)
+benchmark = st.sidebar.text_input("Benchmark ticker", value="SPY").strip().upper()
+rf = st.sidebar.number_input("Risk-free rate (annual, %)", value=0.0, step=0.25) / 100.0
 
-def annualized_vol(returns: pd.Series) -> float:
-    return float(returns.std(ddof=0) * np.sqrt(TRADING_DAYS)) if len(returns) else np.nan
+st.sidebar.markdown("---")
+st.sidebar.subheader("Manage Categories & Tickers")
 
-def annualized_return(returns: pd.Series) -> float:
-    return float(returns.mean() * TRADING_DAYS) if len(returns) else np.nan
+data = load_watchlist()
 
-def sharpe_ratio(returns: pd.Series, rf_annual: float = 0.0) -> float:
-    if not len(returns):
-        return np.nan
-    rf_daily = rf_annual / TRADING_DAYS
-    ex = returns - rf_daily
-    denom = ex.std(ddof=0) * np.sqrt(TRADING_DAYS)
-    return float(ex.mean() * TRADING_DAYS / denom) if denom and not np.isnan(denom) else np.nan
+# Add a ticker
+with st.sidebar.form("add_form", clear_on_submit=True):
+    cat = st.selectbox("Category", DEFAULT_CATEGORIES)
+    new_ticker = st.text_input("Add ticker (e.g., AAPL)")
+    submitted = st.form_submit_button("Add")
+    if submitted and new_ticker.strip():
+        new_ticker = new_ticker.strip().upper()
+        if new_ticker not in data[cat]:
+            data[cat].append(new_ticker)
+            save_watchlist(data)
+            st.success(f"Added {new_ticker} to {cat}")
 
-def sortino_ratio(returns: pd.Series, rf_annual: float = 0.0) -> float:
-    if not len(returns):
-        return np.nan
-    rf_daily = rf_annual / TRADING_DAYS
-    ex = returns - rf_daily
-    downside = ex[ex < 0]
-    dd = downside.std(ddof=0) * np.sqrt(TRADING_DAYS) if len(downside) else np.nan
-    num = ex.mean() * TRADING_DAYS
-    return float(num / dd) if dd and not np.isnan(dd) else np.nan
+# Remove a ticker (optional small helper)
+with st.sidebar.expander("Remove ticker"):
+    cat_r = st.selectbox("Category to edit", DEFAULT_CATEGORIES, key="remove_sel")
+    if data[cat_r]:
+        to_remove = st.selectbox("Ticker", data[cat_r], key="remove_ticker")
+        if st.button("Remove"):
+            data[cat_r] = [t for t in data[cat_r] if t != to_remove]
+            save_watchlist(data)
+            st.success(f"Removed {to_remove} from {cat_r}")
+    else:
+        st.caption("No tickers in this category.")
 
-def tracking_error(returns: pd.Series, bench: pd.Series) -> float:
-    aligned = pd.concat([returns, bench], axis=1).dropna()
-    if aligned.empty:
-        return np.nan
-    active = aligned.iloc[:,0] - aligned.iloc[:,1]
-    return float(active.std(ddof=0) * np.sqrt(TRADING_DAYS))
+st.sidebar.markdown("---")
+selected_cats = st.sidebar.multiselect("Include categories", DEFAULT_CATEGORIES, default=DEFAULT_CATEGORIES)
 
-def beta_alpha_r2(returns: pd.Series, bench: pd.Series, rf_annual: float = 0.0) -> Tuple[float, float, float]:
-    aligned = pd.concat([returns, bench], axis=1).dropna()
-    if aligned.empty:
-        return (np.nan, np.nan, np.nan)
-    rf_daily = rf_annual / TRADING_DAYS
-    y = aligned.iloc[:,0] - rf_daily
-    x = aligned.iloc[:,1] - rf_daily
-    if len(x) < 2:
-        return (np.nan, np.nan, np.nan)
-    cov = np.cov(x, y, ddof=0)[0,1]
-    var = np.var(x, ddof=0)
-    beta = cov / var if var else np.nan
-    # intercept (alpha per day), via means
-    alpha_daily = y.mean() - beta * x.mean() if beta is not np.nan else np.nan
-    # annualize alpha
-    alpha_annual = float(alpha_daily * TRADING_DAYS) if alpha_daily is not np.nan else np.nan
-    # R^2 via correlation^2
-    r = np.corrcoef(x, y)[0,1] if len(x) > 1 else np.nan
-    r2 = float(r**2) if not np.isnan(r) else np.nan
-    return (float(beta), alpha_annual, r2)
+# ---- Main page
+st.title("📊 Custom Watchlist")
 
-def compute_all_metrics(prices: pd.DataFrame, benchmark: str, rf_annual: float = 0.0) -> pd.DataFrame:
-    if prices.empty:
-        return pd.DataFrame()
-    rets = prices.pct_change().dropna()
-    cols = []
-    rows = []
-    for col in prices.columns:
-        if col == benchmark:
-            continue
-        r = rets[col]
-        rb = rets[benchmark] if benchmark in rets.columns else pd.Series(dtype=float)
-        beta, alpha, r2 = beta_alpha_r2(r, rb, rf_annual=rf_annual) if not rb.empty else (np.nan, np.nan, np.nan)
-        rows.append({
-            "Ticker": col,
-            "Sharpe": sharpe_ratio(r, rf_annual),
-            "Sortino": sortino_ratio(r, rf_annual),
-            "Volatility": annualized_vol(r),
-            "Max Drawdown": max_drawdown(prices[col]),
-            "Tracking Error": tracking_error(r, rb) if not rb.empty else np.nan,
-            "Alpha": alpha,
-            "Beta": beta,
-            "R²": r2,
-            "Ann. Return": annualized_return(r),
-        })
-    df = pd.DataFrame(rows).set_index("Ticker")
-    # nicer order
-    order = ["Ann. Return","Sharpe","Sortino","Volatility","Max Drawdown","Tracking Error","Alpha","Beta","R²"]
-    return df[order]
+# Glossary (one-line explanations)
+with st.expander("Metrics Glossary (one-liners)"):
+    st.write("""
+- **Ann. Return** — Average daily return annualized (×252).
+- **Sharpe** — Risk-adjusted return using total volatility (excess return / volatility).
+- **Sortino** — Risk-adjusted return using downside volatility only.
+- **Volatility** — Annualized standard deviation of daily returns.
+- **Max Drawdown** — Worst peak-to-trough decline in the price series.
+- **Tracking Error** — Volatility of (asset − benchmark) returns (annualized).
+- **Alpha** — Annualized intercept from regressing excess returns vs benchmark (skill beyond beta).
+- **Beta** — Sensitivity of the asset to the benchmark (slope of regression).
+- **R²** — Fraction of return variance explained by the benchmark.
+""")
+
+# Build ticker universe
+universe = []
+for c in selected_cats:
+    universe.extend(data.get(c, []))
+# Ensure benchmark is fetched too
+tickers_to_fetch = sorted(set(universe + ([benchmark] if benchmark else [])))
+
+if not universe:
+    st.info("Add some tickers in the sidebar to get started.")
+    st.stop()
+
+# Fetch prices
+with st.spinner("Fetching price history…"):
+    prices = fetch_close_many(tickers_to_fetch, period=period)
+
+if prices.empty:
+    st.error("Could not fetch any data. Check tickers/timeframe.")
+    st.stop()
+
+# Compute metrics
+metrics = compute_all_metrics(prices, benchmark=benchmark, rf_annual=rf)
+
+# Display metrics table (sortable)
+st.subheader("Metrics Table")
+st.caption("Tip: Click column headers to sort. Use the download below for a CSV without this guide.")
+st.dataframe(metrics.style.format({
+    "Ann. Return": "{:.2%}",
+    "Sharpe": "{:.2f}",
+    "Sortino": "{:.2f}",
+    "Volatility": "{:.2%}",
+    "Max Drawdown": "{:.2%}",
+    "Tracking Error": "{:.2%}",
+    "Alpha": "{:.2%}",
+    "Beta": "{:.2f}",
+    "R²": "{:.2f}",
+}), use_container_width=True)
+
+# Download CSV (data only)
+csv = metrics.to_csv(index=True).encode("utf-8")
+st.download_button("⬇️ Download CSV (data only)", data=csv, file_name="watchlist_metrics.csv", mime="text/csv")
+
+# Time-series chart
+st.subheader("Time-Series")
+pick = st.selectbox("Choose a ticker to chart", sorted(universe))
+if pick in prices:
+    st.line_chart(prices[[pick, benchmark]].dropna(), height=350)
