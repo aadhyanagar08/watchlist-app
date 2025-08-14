@@ -1,11 +1,11 @@
-# 📈 Watchlist App
+# Watchlist App
 
 A **Streamlit-powered** financial dashboard for tracking and analyzing your own watchlist of stocks and ETFs.  
 This tool allows users to input custom tickers, select a benchmark, fetch historical price data from **Yahoo Finance**, and compare performance metrics over a selected time horizon.
 
 ---
 
-## 🚀 Features
+## Features
 
 ### 1. Custom Watchlist
 - Add any Yahoo Finance-supported ticker symbol (e.g., `AAPL`, `MSFT`, `VTI`, `^GSPC`)
@@ -35,7 +35,7 @@ This tool allows users to input custom tickers, select a benchmark, fetch histor
 
 ---
 
-## 🛠 Tech Stack
+## Tech Stack
 
 - **Python 3.9+**
 - **Streamlit** – web app framework
@@ -45,9 +45,9 @@ This tool allows users to input custom tickers, select a benchmark, fetch histor
 
 ---
 
-## 📦 Installation & Setup
+### Installation & Setup
 
-### 1️⃣ Clone the repository
+### 1️Clone the repository
 ```bash
 git clone https://github.com/your-username/watchlist-app.git
 cd watchlist-app
