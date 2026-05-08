@@ -5,15 +5,14 @@ import numpy as np
 
 from src.storage import load_watchlist, save_watchlist, DEFAULT_CATEGORIES
 from src.data_sources import fetch_close_many
-from src.metrics import (
-    compute_all_metrics, daily_returns, TRADING_DAYS, annualized_return
-)
-from src.fundamentals import compute_fundamentals
+from src.metrics import compute_all_metrics, annualized_return
 from src.helptext import HELP, interpret_metric
 from src.input_utils import parse_ticker_list
 from src.fundamentals import fetch_fundamentals_many
 from src.symbols import normalize_list, normalize_ticker
+from src.benchmarking import AnalysisBenchmark
 
+DEFAULT_QUICK_COMPARE = "AAPL, MSFT, VTI"
 
 st.set_page_config(page_title="Custom Watchlist", layout="wide")
 
@@ -39,8 +38,7 @@ data = load_watchlist()
 with st.sidebar.form("add_form", clear_on_submit=True):
     cat = st.selectbox("Category", DEFAULT_CATEGORIES)
     new_ticker = st.text_input("Add ticker (e.g., AAPL)")
-    submitted = st.form_submit_button("Add")
-    if submitted and new_ticker.strip():
+    if st.form_submit_button("Add") and new_ticker.strip():
         nt = new_ticker.strip().upper()
         if nt not in data[cat]:
             data[cat].append(nt)
@@ -65,9 +63,15 @@ selected_cats = st.sidebar.multiselect(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Quick Compare (ad-hoc)")
+
+if st.sidebar.button("↺ Reset to default"):
+    st.session_state["quick_compare"] = DEFAULT_QUICK_COMPARE
+    st.rerun()
+
 user_tickers_text = st.sidebar.text_area(
     "Tickers (comma or newline separated)",
-    value="AAPL, MSFT, VTI",
+    value=st.session_state.get("quick_compare", DEFAULT_QUICK_COMPARE),
+    key="quick_compare",
     height=80,
     help="Example: AAPL, MSFT, VTI",
 )
@@ -80,11 +84,10 @@ st.title("📊 Custom Watchlist")
 with st.expander("📘 Metrics Glossary"):
     st.write("""
 - **P/E** — Price divided by trailing 12-month earnings per share.
-- **D/E** — Total debt divided by shareholders’ equity.
+- **D/E** — Total debt divided by shareholders' equity.
 - **Div Yield** — Annual dividends divided by price.
 - **Net Profit Margin** — Net income divided by revenue.
 - **Expense Ratio** — Annual ETF fee as a % of assets.
-
 - **Ann. Return** — Average daily return annualized (×252).
 - **Sharpe** — Excess return per unit of total volatility.
 - **Sortino** — Excess return per unit of downside volatility.
@@ -96,46 +99,55 @@ with st.expander("📘 Metrics Glossary"):
 - **R²** — % of variance explained by the benchmark.
 """)
 
-# Build the working universe:
+# Build ticker universe: merge Quick Compare + selected categories
 user_tickers = normalize_list(parse_ticker_list(user_tickers_text))
-if not user_tickers:
-    # Fall back to saved categories if the ad-hoc list is empty
-    for c in selected_cats:
-        user_tickers.extend(data.get(c, []))
-    user_tickers = sorted(set(user_tickers))
+for c in selected_cats:
+    user_tickers.extend(data.get(c, []))
+user_tickers = sorted(set(user_tickers))
 
 if not user_tickers:
     st.info("Add some tickers (Quick Compare) or via Categories in the sidebar to get started.")
     st.stop()
 
-# Always fetch benchmark too (if provided)
 tickers_to_fetch = sorted(set(user_tickers + ([benchmark] if benchmark else [])))
 
-# Fetch prices
-with st.spinner("Fetching price history…"):
-    prices = fetch_close_many(tickers_to_fetch, period=period)
+# Fetch + compute inside the benchmark context manager
+with AnalysisBenchmark(n_tickers=len(user_tickers)) as bm:
+    with st.spinner("Fetching price history…"):
+        prices = fetch_close_many(tickers_to_fetch, period=period)
 
-if prices.empty:
-    st.error("Could not fetch any data. Check tickers, benchmark, or timeframe.")
-    st.stop()
+    if prices.empty:
+        st.error("Could not fetch any data. Check tickers, benchmark, or timeframe.")
+        st.stop()
 
-# Warn if anything failed to load
-missing = sorted(set(tickers_to_fetch) - set(prices.columns))
-if missing:
-    st.warning(
-        "Could not load data for: " + ", ".join(missing) +
-        ". Tip: use proper Yahoo tickers (e.g., S&P 500 → ^GSPC)."
+    missing = sorted(set(tickers_to_fetch) - set(prices.columns))
+    if missing:
+        st.warning(
+            "Could not load data for: " + ", ".join(missing) +
+            ". Tip: use proper Yahoo tickers (e.g., S&P 500 → ^GSPC)."
+        )
+
+    metrics = compute_all_metrics(prices, benchmark=benchmark, rf_annual=rf)
+    funds = fetch_fundamentals_many(metrics.index.tolist())
+    combined = metrics.join(funds, how="left")
+
+# Efficiency banner
+st.info(bm.caption())
+
+with st.expander("🔬 Analysis Performance Log"):
+    s = bm.summary()
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Tickers Analyzed", s["tickers_analyzed"])
+    col2.metric("Automated Time", f"{s['automated_seconds']}s")
+    col3.metric("Manual Baseline", f"{s['manual_baseline_seconds']}s")
+    col4.metric("Efficiency Gain", f"{s['efficiency_gain_pct']}%")
+    st.caption(
+        "Manual baseline assumes ~4 min/ticker for equivalent Excel analysis: "
+        "price download + paste (45s), metric computation (90s), "
+        "fundamentals lookup (60s), chart creation (45s)."
     )
 
-# Compute performance metrics (returns-based)
-metrics = compute_all_metrics(prices, benchmark=benchmark, rf_annual=rf)
-
-# Fundamentals for the same tickers shown in the metrics table (metrics excludes the benchmark)
-fund_tickers = metrics.index.tolist()
-funds = fetch_fundamentals_many(fund_tickers)
-combined = metrics.join(funds, how="left")
-
-# Column config with help tooltips and formatting
+# Column config
 col_config = {
     "Ann. Return":       st.column_config.NumberColumn("Ann. Return", help=HELP["Ann. Return"], format="%.2f%%"),
     "Sharpe":            st.column_config.NumberColumn("Sharpe", help=HELP["Sharpe"], format="%.2f"),
@@ -153,20 +165,17 @@ col_config = {
     "Expense Ratio":     st.column_config.NumberColumn("Expense Ratio", help=HELP["Expense Ratio"], format="%.2f%%"),
 }
 
-# Convert decimal % columns to human % for display
+# Convert decimal → % for display only
 display_df = combined.copy()
-for pct_col in [
-    "Ann. Return", "Volatility", "Max Drawdown", "Tracking Error",
-    "Alpha", "Div Yield", "Net Profit Margin", "Expense Ratio"
-]:
+for pct_col in ["Ann. Return", "Volatility", "Max Drawdown", "Tracking Error",
+                "Alpha", "Div Yield", "Net Profit Margin", "Expense Ratio"]:
     if pct_col in display_df.columns:
-        display_df[pct_col] = display_df[pct_col] * 100.0
+        display_df[pct_col] *= 100.0
 
 st.subheader("All Metrics (Performance + Fundamentals)")
 st.caption("Tip: Click column headers to sort. Download below for a clean CSV.")
 st.dataframe(display_df, use_container_width=True, column_config=col_config)
 
-# Downloads
 st.download_button(
     "⬇️ Download Combined CSV",
     data=combined.to_csv(index=True).encode("utf-8"),
@@ -174,43 +183,37 @@ st.download_button(
     mime="text/csv",
 )
 
-# Time-series chart (resilient to missing benchmark)
+# Time-series chart
 st.subheader("Time-Series")
 valid_choices = sorted([t for t in user_tickers if t in prices.columns])
 if not valid_choices:
     st.info("No valid tickers loaded to chart.")
 else:
     pick = st.selectbox("Choose a ticker to chart", valid_choices)
-    series_to_plot = []
-    if pick in prices.columns:
-        series_to_plot.append(pick)
-    if benchmark and (benchmark in prices.columns) and (benchmark != pick):
+    series_to_plot = [pick]
+    if benchmark and benchmark in prices.columns and benchmark != pick:
         series_to_plot.append(benchmark)
     else:
         st.caption(f"Benchmark '{benchmark_input}' not available; charting {pick} only.")
-    if series_to_plot:
-        st.line_chart(prices[series_to_plot].dropna(), height=350)
+    st.line_chart(prices[series_to_plot].dropna(), height=350)
 
-# Per-ticker Insights (explain *all* metrics in plain English)
+# Per-ticker insights
 st.subheader("📘 Insights (per ticker)")
 if not combined.empty:
     ex_ticker = st.selectbox("Pick a ticker", list(combined.index))
-    # Benchmark annualized return for context in Ann. Return interpretation
-    bench_ann_ret = None
-    if benchmark in prices.columns:
-        bench_ann_ret = annualized_return(prices[benchmark].pct_change().dropna())
+    bench_ann_ret = (
+        annualized_return(prices[benchmark].pct_change().dropna())
+        if benchmark in prices.columns else None
+    )
     context = {"bench_ann_return": bench_ann_ret}
 
-    explain_order = [
+    explain_order = [c for c in [
         "Ann. Return", "Sharpe", "Sortino", "Volatility", "Max Drawdown",
         "Tracking Error", "Alpha", "Beta", "R²",
         "P/E", "D/E", "Div Yield", "Net Profit Margin", "Expense Ratio"
-    ]
-    explain_order = [c for c in explain_order if c in combined.columns]
-    row = combined.loc[ex_ticker, explain_order]
+    ] if c in combined.columns]
 
     for col in explain_order:
-        val = row[col]
-        # pass the raw decimal values (not the 100x display copies)
+        val = combined.loc[ex_ticker, col]
         vfloat = float(val) if pd.notna(val) else np.nan
         st.markdown(f"- **{col}** — {interpret_metric(col, vfloat, context)}")
